@@ -7,8 +7,11 @@ on:
   push:
     branches: [main, repo-1, stable, maint]
     tags: [v*]
+  pull_request:
+    branches: ['**']
 
 jobs:
+  # Unit and integration (e2e) tests for GitLab support and the rest of the codebase.
   test:
     strategy:
       fail-fast: false
@@ -28,5 +31,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install pytest
-    - name: Run tests
-      run: python -m pytest
+    - name: Run unit tests
+      run: python -m pytest tests/ --ignore=tests/test_wrapper.py -v
+    - name: Run e2e (integration) tests
+      run: python -m pytest tests/test_gitlab_e2e.py -v

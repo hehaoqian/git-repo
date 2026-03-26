@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 from typing import Optional
 import unittest
+from unittest import mock
 
 import utils_for_test
 
@@ -565,3 +566,146 @@ class ManifestPropertiesFetchedCorrectly(unittest.TestCase):
 
             fakeproj.config.SetString("manifest.platform", "auto")
             self.assertEqual(fakeproj.manifest_platform, "auto")
+
+
+class GitlabPathTests(unittest.TestCase):
+    """Tests for Project.GitlabPath and Project.RootGroup properties."""
+
+    def _make_project_with_url(self, url):
+        """Create a minimal mock project with the given remote URL."""
+        proj = mock.MagicMock()
+        proj.remote.url = url
+        proj.GitlabPath = project.Project.GitlabPath.fget(proj)
+        proj.RootGroup = project.Project.RootGroup.fget(proj)
+        return proj
+
+    def test_http_url_with_subgroup(self):
+        proj = self._make_project_with_url(
+            "http://gitlab.com/rootgroup/subgroup/repo1.git"
+        )
+        self.assertEqual(proj.GitlabPath, "rootgroup/subgroup/repo1")
+        self.assertEqual(proj.RootGroup, "rootgroup")
+
+    def test_https_url(self):
+        proj = self._make_project_with_url(
+            "https://gitlab.com/myorg/myrepo.git"
+        )
+        self.assertEqual(proj.GitlabPath, "myorg/myrepo")
+        self.assertEqual(proj.RootGroup, "myorg")
+
+    def test_ssh_url_with_port(self):
+        proj = self._make_project_with_url(
+            "ssh://git@gitlab.com:29418/rootgroup/subgroup/repo1.git"
+        )
+        self.assertEqual(proj.GitlabPath, "rootgroup/subgroup/repo1")
+        self.assertEqual(proj.RootGroup, "rootgroup")
+
+    def test_git_scp_style_url(self):
+        proj = self._make_project_with_url(
+            "git@gitlab.com:rootgroup/subgroup/repo.git"
+        )
+        self.assertEqual(proj.GitlabPath, "rootgroup/subgroup/repo")
+        self.assertEqual(proj.RootGroup, "rootgroup")
+
+    def test_url_without_git_suffix(self):
+        proj = self._make_project_with_url(
+            "https://gitlab.com/myorg/myrepo"
+        )
+        self.assertEqual(proj.GitlabPath, "myorg/myrepo")
+
+    def test_deeply_nested_path(self):
+        proj = self._make_project_with_url(
+            "https://gitlab.com/a/b/c/d/repo.git"
+        )
+        self.assertEqual(proj.GitlabPath, "a/b/c/d/repo")
+        self.assertEqual(proj.RootGroup, "a")
+
+
+class AdjustOptionFormatOfTopicTests(unittest.TestCase):
+    """Tests for Project._AdjustOptionFormatOfTopic."""
+
+    def test_topic_equals_format_converted(self):
+        result = project.Project._AdjustOptionFormatOfTopic(["topic=my-topic"])
+        self.assertEqual(result, ["merge_request.label=topic::my-topic"])
+
+    def test_topic_double_colon_format_converted(self):
+        result = project.Project._AdjustOptionFormatOfTopic(["topic::my-feat"])
+        self.assertEqual(result, ["merge_request.label=topic::my-feat"])
+
+    def test_other_options_pass_through(self):
+        result = project.Project._AdjustOptionFormatOfTopic(
+            ["merge_request.create", "some-other-option"]
+        )
+        self.assertEqual(
+            result, ["merge_request.create", "some-other-option"]
+        )
+
+    def test_mixed_options(self):
+        result = project.Project._AdjustOptionFormatOfTopic(
+            ["topic=abc", "other=value", "topic::def"]
+        )
+        self.assertEqual(
+            result,
+            [
+                "merge_request.label=topic::abc",
+                "other=value",
+                "merge_request.label=topic::def",
+            ],
+        )
+
+    def test_none_input_returns_empty_list(self):
+        result = project.Project._AdjustOptionFormatOfTopic(None)
+        self.assertEqual(result, [])
+
+    def test_empty_list_input_returns_empty_list(self):
+        result = project.Project._AdjustOptionFormatOfTopic([])
+        self.assertEqual(result, [])
+
+
+class GitlabMRCreationPushOptionsTests(unittest.TestCase):
+    """Tests for Project._GitlabMRCreationPushOptions."""
+
+    def test_basic_options_present(self):
+        opts = project.Project._GitlabMRCreationPushOptions("main")
+        self.assertIn("merge_request.create", opts)
+        self.assertIn("merge_request.target=main", opts)
+        self.assertIn("merge_request.skip_mono_central_pipeline", opts)
+
+    def test_draft_adds_draft_option(self):
+        opts = project.Project._GitlabMRCreationPushOptions("main", draft=True)
+        self.assertIn("merge_request.draft", opts)
+
+    def test_no_draft_by_default(self):
+        opts = project.Project._GitlabMRCreationPushOptions("main")
+        self.assertNotIn("merge_request.draft", opts)
+
+    def test_title_adds_title_option(self):
+        opts = project.Project._GitlabMRCreationPushOptions("main", title="My MR")
+        title_opts = [o for o in opts if o.startswith("merge_request.title=")]
+        self.assertEqual(len(title_opts), 1)
+        self.assertIn("My MR", title_opts[0])
+
+    def test_empty_title_not_added(self):
+        opts = project.Project._GitlabMRCreationPushOptions("main", title="")
+        title_opts = [o for o in opts if o.startswith("merge_request.title=")]
+        self.assertEqual(title_opts, [])
+
+    def test_title_with_newlines_sanitized(self):
+        opts = project.Project._GitlabMRCreationPushOptions(
+            "main", title="Line1\nLine2"
+        )
+        title_opts = [o for o in opts if o.startswith("merge_request.title=")]
+        self.assertEqual(len(title_opts), 1)
+        self.assertNotIn("\n", title_opts[0])
+
+    def test_title_with_quotes_escaped(self):
+        opts = project.Project._GitlabMRCreationPushOptions(
+            "main", title='Say "hello"'
+        )
+        title_opts = [o for o in opts if o.startswith("merge_request.title=")]
+        self.assertEqual(len(title_opts), 1)
+        self.assertIn('\\"hello\\"', title_opts[0])
+
+    def test_target_branch_used(self):
+        opts = project.Project._GitlabMRCreationPushOptions("dev-branch")
+        self.assertIn("merge_request.target=dev-branch", opts)

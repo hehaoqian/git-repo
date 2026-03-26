@@ -1595,3 +1595,372 @@ class NormalizeUrlTests(ManifestParseTestCase):
             manifestUrl="ssh://git@github.com/org2/custom_manifest.git",
         )
         self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
+
+
+class PushOptionsTests(unittest.TestCase):
+    """Tests for manifest_xml._PushOptions."""
+
+    def test_default_empty(self):
+        p = manifest_xml._PushOptions()
+        self.assertEqual(p.central_ci_project, [])
+        self.assertEqual(p.business_projects, [])
+
+    def test_equality(self):
+        a = manifest_xml._PushOptions()
+        a.central_ci_project = ["ci.variable='X=1'"]
+        b = manifest_xml._PushOptions()
+        b.central_ci_project = ["ci.variable='X=1'"]
+        self.assertEqual(a, b)
+        b.business_projects = ["extra"]
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, "not-a-push-options")
+
+    def test_fetch_central_ci_project_variables_basic(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = ["ci.variable='MY_VAR=hello'"]
+        self.assertEqual(
+            p.fetch_central_ci_project_variables(), {"MY_VAR": "hello"}
+        )
+
+    def test_fetch_central_ci_project_variables_double_quotes(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = ['ci.variable="MY_VAR=world"']
+        self.assertEqual(
+            p.fetch_central_ci_project_variables(), {"MY_VAR": "world"}
+        )
+
+    def test_fetch_central_ci_project_variables_value_with_equals(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = ["ci.variable='K=a=b'"]
+        self.assertEqual(p.fetch_central_ci_project_variables(), {"K": "a=b"})
+
+    def test_fetch_central_ci_project_variables_ignores_non_ci_variable(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = ["merge_request.label=foo", "ci.variable='A=1'"]
+        self.assertEqual(p.fetch_central_ci_project_variables(), {"A": "1"})
+
+    def test_fetch_central_ci_project_variables_empty(self):
+        p = manifest_xml._PushOptions()
+        self.assertEqual(p.fetch_central_ci_project_variables(), {})
+
+    def test_fetch_central_ci_project_mr_options_all_fields(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = [
+            "merge_request.assign=root",
+            "merge_request.title=My Title",
+            "merge_request.description=My Desc",
+            "merge_request.label=l1",
+            "merge_request.label=l2",
+            "merge_request.squash",
+        ]
+        result = p.fetch_central_ci_project_mr_options()
+        self.assertEqual(result["assignee_id"], "root")
+        self.assertEqual(result["title"], "My Title")
+        self.assertEqual(result["description"], "My Desc")
+        self.assertIn("l1", result["labels"])
+        self.assertIn("l2", result["labels"])
+        self.assertTrue(result["squash"])
+
+    def test_fetch_central_ci_project_mr_options_empty(self):
+        p = manifest_xml._PushOptions()
+        self.assertEqual(p.fetch_central_ci_project_mr_options(), {})
+
+    def test_fetch_central_ci_project_mr_options_ignores_non_mr(self):
+        p = manifest_xml._PushOptions()
+        p.central_ci_project = ["ci.variable='K=v'"]
+        self.assertEqual(p.fetch_central_ci_project_mr_options(), {})
+
+
+class MrTitleSuffixTests(unittest.TestCase):
+    """Tests for manifest_xml._MrTitleSuffix."""
+
+    def test_default_empty(self):
+        m = manifest_xml._MrTitleSuffix()
+        self.assertEqual(m.central_ci_project, "")
+        self.assertEqual(m.business_projects, "")
+
+    def test_equality(self):
+        a = manifest_xml._MrTitleSuffix()
+        a.central_ci_project = "suffix"
+        b = manifest_xml._MrTitleSuffix()
+        b.central_ci_project = "suffix"
+        self.assertEqual(a, b)
+        b.business_projects = "other"
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, "string")
+
+
+class GitlabDefaultElementTests(ManifestParseTestCase):
+    """Tests for GitLab attributes in the <default> element."""
+
+    def test_gitlab_url_parsed(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"/>'
+            "</manifest>"
+        )
+        self.assertEqual(
+            manifest.default.gitlab_url, "https://gitlab.example.com"
+        )
+
+    def test_gitlab_url_defaults_to_none(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "</manifest>"
+        )
+        self.assertIsNone(manifest.default.gitlab_url)
+
+    def test_enable_central_ci_pipeline_parsed(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"'
+            '  enable-central-ci-pipeline="true"/>'
+            "</manifest>"
+        )
+        self.assertTrue(manifest.default.enable_central_ci_pipeline)
+
+    def test_central_ci_pipeline_must_success_parsed(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"'
+            '  central-ci-pipeline-must-success="true"/>'
+            "</manifest>"
+        )
+        self.assertTrue(manifest.default.central_ci_pipeline_must_success)
+
+    def test_mono_upload_create_mr_for_central_ci_project_parsed(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"'
+            '  mono-upload-create-mr-for-central-ci-project="true"/>'
+            "</manifest>"
+        )
+        self.assertTrue(
+            manifest.default.mono_upload_create_mr_for_central_ci_project
+        )
+
+    def test_mono_upload_create_mr_for_business_projects_parsed(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"'
+            '  mono-upload-create-mr-for-business-projects="true"/>'
+            "</manifest>"
+        )
+        self.assertTrue(
+            manifest.default.mono_upload_create_mr_for_business_projects
+        )
+
+    def test_enable_central_ci_pipeline_requires_gitlab_url(self):
+        with self.assertRaises(error.ManifestParseError):
+            manifest = self.getXmlManifest(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<manifest>"
+                '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+                '<default remote="origin" revision="main"'
+                '  enable-central-ci-pipeline="true"/>'
+                "</manifest>"
+            )
+            # Access a property to force manifest parsing.
+            _ = manifest.default
+
+    def test_gitlab_url_must_be_http_or_https(self):
+        with self.assertRaises(error.ManifestParseError):
+            manifest = self.getXmlManifest(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<manifest>"
+                '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+                '<default remote="origin" revision="main"'
+                '  gitlab-url="ftp://gitlab.example.com"'
+                '  enable-central-ci-pipeline="true"/>'
+                "</manifest>"
+            )
+            # Access a property to force manifest parsing.
+            _ = manifest.default
+
+
+class PushOptionsElementTests(ManifestParseTestCase):
+    """Tests for the <push-options> manifest element."""
+
+    def test_parse_central_ci_project_options(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<push-options>"
+            "<central-ci-project>"
+            "<option>ci.variable='MY_VAR=val'</option>"
+            "<option>merge_request.label=l1</option>"
+            "</central-ci-project>"
+            "</push-options>"
+            "</manifest>"
+        )
+        self.assertIsNotNone(manifest.push_options)
+        self.assertIn("ci.variable='MY_VAR=val'", manifest.push_options.central_ci_project)
+        self.assertIn("merge_request.label=l1", manifest.push_options.central_ci_project)
+
+    def test_parse_business_projects_options(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<push-options>"
+            "<business-projects>"
+            "<option>my-option</option>"
+            "</business-projects>"
+            "</push-options>"
+            "</manifest>"
+        )
+        self.assertIn("my-option", manifest.push_options.business_projects)
+
+    def test_defaults_to_empty_push_options_when_absent(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "</manifest>"
+        )
+        self.assertIsNotNone(manifest.push_options)
+        self.assertEqual(manifest.push_options.central_ci_project, [])
+        self.assertEqual(manifest.push_options.business_projects, [])
+
+    def test_duplicate_push_options_raises_error(self):
+        with self.assertRaises(error.ManifestParseError):
+            manifest = self.getXmlManifest(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<manifest>"
+                '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+                '<default remote="origin" revision="main"/>'
+                "<push-options><central-ci-project/></push-options>"
+                "<push-options><central-ci-project/></push-options>"
+                "</manifest>"
+            )
+            # Access a property to force manifest parsing.
+            _ = manifest.push_options
+
+
+class MrTitleSuffixElementTests(ManifestParseTestCase):
+    """Tests for the <mr-title-suffix> manifest element."""
+
+    def test_parse_central_ci_project_suffix(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<mr-title-suffix>"
+            "<central-ci-project>my suffix</central-ci-project>"
+            "</mr-title-suffix>"
+            "</manifest>"
+        )
+        self.assertEqual(
+            manifest.mr_title_suffix.central_ci_project, "my suffix"
+        )
+
+    def test_parse_business_projects_suffix(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<mr-title-suffix>"
+            "<business-projects>biz suffix</business-projects>"
+            "</mr-title-suffix>"
+            "</manifest>"
+        )
+        self.assertEqual(
+            manifest.mr_title_suffix.business_projects, "biz suffix"
+        )
+
+    def test_defaults_to_empty_when_absent(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "</manifest>"
+        )
+        self.assertIsNotNone(manifest.mr_title_suffix)
+        self.assertEqual(manifest.mr_title_suffix.central_ci_project, "")
+        self.assertEqual(manifest.mr_title_suffix.business_projects, "")
+
+    def test_duplicate_mr_title_suffix_raises_error(self):
+        with self.assertRaises(error.ManifestParseError):
+            manifest = self.getXmlManifest(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<manifest>"
+                '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+                '<default remote="origin" revision="main"/>'
+                "<mr-title-suffix><central-ci-project>a</central-ci-project></mr-title-suffix>"
+                "<mr-title-suffix><central-ci-project>b</central-ci-project></mr-title-suffix>"
+                "</manifest>"
+            )
+            # Access a property to force manifest parsing.
+            _ = manifest.mr_title_suffix
+
+
+class GitlabToXmlTests(ManifestParseTestCase):
+    """Tests for round-trip serialization of GitLab attributes in ToXml."""
+
+    def test_gitlab_url_round_trip(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"'
+            '  gitlab-url="https://gitlab.example.com"/>'
+            "</manifest>"
+        )
+        xml_str = manifest.ToXml().toxml()
+        self.assertIn("gitlab-url", xml_str)
+        self.assertIn("https://gitlab.example.com", xml_str)
+
+    def test_push_options_round_trip(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<push-options>"
+            "<central-ci-project><option>ci.variable='A=1'</option></central-ci-project>"
+            "</push-options>"
+            "</manifest>"
+        )
+        xml_str = manifest.ToXml().toxml()
+        self.assertIn("push-options", xml_str)
+        self.assertIn("ci.variable", xml_str)
+
+    def test_mr_title_suffix_round_trip(self):
+        manifest = self.getXmlManifest(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<manifest>"
+            '<remote name="origin" fetch="https://gitlab.example.com/"/>'
+            '<default remote="origin" revision="main"/>'
+            "<mr-title-suffix>"
+            "<central-ci-project>my suffix</central-ci-project>"
+            "</mr-title-suffix>"
+            "</manifest>"
+        )
+        xml_str = manifest.ToXml().toxml()
+        self.assertIn("mr-title-suffix", xml_str)
+        self.assertIn("my suffix", xml_str)
