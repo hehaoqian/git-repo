@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import sys
+from typing import Any, Dict, List, Optional
 import urllib.parse
 import xml.dom.minidom
 
@@ -159,6 +160,11 @@ class _Default:
     sync_c = False
     sync_s = False
     sync_tags = True
+    gitlab_url = None
+    enable_central_ci_pipeline = False
+    central_ci_pipeline_must_success = False
+    mono_upload_create_mr_for_central_ci_project = False
+    mono_upload_create_mr_for_business_projects = False
 
     def __eq__(self, other):
         if not isinstance(other, _Default):
@@ -169,6 +175,80 @@ class _Default:
         if not isinstance(other, _Default):
             return True
         return self.__dict__ != other.__dict__
+
+
+class _PushOptions:
+    """Push options configuration within the manifest."""
+
+    def __init__(self):
+        self.central_ci_project: List[str] = []
+        self.business_projects: List[str] = []
+
+    def fetch_central_ci_project_variables(self) -> Dict[str, str]:
+        """Parse ci.variable='VAR_NAME=value' entries into a dict."""
+        variables: Dict[str, str] = {}
+        for option in self.central_ci_project:
+            if option.startswith("ci.variable="):
+                value = option[len("ci.variable="):]
+                # Strip surrounding quotes
+                if (value.startswith("'") and value.endswith("'")) or (
+                    value.startswith('"') and value.endswith('"')
+                ):
+                    value = value[1:-1]
+                if "=" in value:
+                    var_name, var_value = value.split("=", 1)
+                    variables[var_name] = var_value
+        return variables
+
+    def fetch_central_ci_project_mr_options(self) -> Dict[str, Any]:
+        """Parse merge_request.* options into a GitLab API-friendly dict."""
+        result: Dict[str, Any] = {}
+        labels: List[str] = []
+        for option in self.central_ci_project:
+            if not option.startswith("merge_request."):
+                continue
+            rest = option[len("merge_request."):]
+            if rest == "squash":
+                rest = "squash=True"
+            if "=" in rest:
+                key, value = rest.split("=", 1)
+                if key == "assign":
+                    result["assignee_id"] = value
+                elif key == "title":
+                    result["title"] = value
+                elif key == "description":
+                    result["description"] = value
+                elif key == "label":
+                    labels.append(value)
+                elif key == "squash":
+                    result["squash"] = value == "True"
+        if labels:
+            result["labels"] = labels
+        return result
+
+    def __eq__(self, other):
+        if not isinstance(other, _PushOptions):
+            return False
+        return self.__dict__ == other.__dict__
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+
+class _MrTitleSuffix:
+    """MR title suffix configuration within the manifest."""
+
+    def __init__(self):
+        self.central_ci_project: str = ""
+        self.business_projects: str = ""
+
+    def __eq__(self, other):
+        if not isinstance(other, _MrTitleSuffix):
+            return False
+        return self.__dict__ == other.__dict__
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
 
 class _XmlRemote:
@@ -644,6 +724,21 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         if not d.sync_tags:
             have_default = True
             e.setAttribute("sync-tags", "false")
+        if d.gitlab_url:
+            have_default = True
+            e.setAttribute("gitlab-url", d.gitlab_url)
+        if d.enable_central_ci_pipeline:
+            have_default = True
+            e.setAttribute("enable-central-ci-pipeline", "true")
+        if d.central_ci_pipeline_must_success:
+            have_default = True
+            e.setAttribute("central-ci-pipeline-must-success", "true")
+        if d.mono_upload_create_mr_for_central_ci_project:
+            have_default = True
+            e.setAttribute("mono-upload-create-mr-for-central-ci-project", "true")
+        if d.mono_upload_create_mr_for_business_projects:
+            have_default = True
+            e.setAttribute("mono-upload-create-mr-for-business-projects", "true")
         if have_default:
             root.appendChild(e)
             root.appendChild(doc.createTextNode(""))
@@ -651,6 +746,50 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         if self._manifest_server:
             e = doc.createElement("manifest-server")
             e.setAttribute("url", self._manifest_server)
+            root.appendChild(e)
+            root.appendChild(doc.createTextNode(""))
+
+        if self._push_options and (
+            self._push_options.central_ci_project
+            or self._push_options.business_projects
+        ):
+            e = doc.createElement("push-options")
+            if self._push_options.central_ci_project:
+                central_ci_element = doc.createElement("central-ci-project")
+                for option in self._push_options.central_ci_project:
+                    if option:
+                        option_element = doc.createElement("option")
+                        option_element.appendChild(doc.createTextNode(str(option)))
+                        central_ci_element.appendChild(option_element)
+                e.appendChild(central_ci_element)
+            if self._push_options.business_projects:
+                business_element = doc.createElement("business-projects")
+                for option in self._push_options.business_projects:
+                    if option:
+                        option_element = doc.createElement("option")
+                        option_element.appendChild(doc.createTextNode(str(option)))
+                        business_element.appendChild(option_element)
+                e.appendChild(business_element)
+            root.appendChild(e)
+            root.appendChild(doc.createTextNode(""))
+
+        if self._mr_title_suffix and (
+            self._mr_title_suffix.central_ci_project
+            or self._mr_title_suffix.business_projects
+        ):
+            e = doc.createElement("mr-title-suffix")
+            if self._mr_title_suffix.central_ci_project:
+                central_ci_element = doc.createElement("central-ci-project")
+                central_ci_element.appendChild(
+                    doc.createTextNode(self._mr_title_suffix.central_ci_project)
+                )
+                e.appendChild(central_ci_element)
+            if self._mr_title_suffix.business_projects:
+                business_element = doc.createElement("business-projects")
+                business_element.appendChild(
+                    doc.createTextNode(self._mr_title_suffix.business_projects)
+                )
+                e.appendChild(business_element)
             root.appendChild(e)
             root.appendChild(doc.createTextNode(""))
 
@@ -998,6 +1137,18 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         return self._manifest_server
 
     @property
+    def push_options(self) -> Optional["_PushOptions"]:
+        """Return push options for this manifest."""
+        self._Load()
+        return self._push_options
+
+    @property
+    def mr_title_suffix(self) -> Optional["_MrTitleSuffix"]:
+        """Return MR title suffix for this manifest."""
+        self._Load()
+        return self._mr_title_suffix
+
+    @property
     def CloneBundle(self):
         clone_bundle = self.manifestProject.clone_bundle
         if clone_bundle is None:
@@ -1151,6 +1302,8 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         self._notice = None
         self.branch = None
         self._manifest_server = None
+        self._push_options = None
+        self._mr_title_suffix = None
 
     def Load(self):
         """Read the manifest into memory."""
@@ -1425,6 +1578,25 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                         "duplicate manifest-server in %s" % (self.manifestFile)
                     )
                 self._manifest_server = url
+
+        for node in itertools.chain(*node_list):
+            if node.nodeName == "push-options":
+                if self._push_options is not None:
+                    raise ManifestParseError(
+                        "duplicate push-options in %s" % (self.manifestFile)
+                    )
+                self._push_options = self._ParsePushOptions(node)
+            elif node.nodeName == "mr-title-suffix":
+                if self._mr_title_suffix is not None:
+                    raise ManifestParseError(
+                        "duplicate mr-title-suffix in %s" % (self.manifestFile)
+                    )
+                self._mr_title_suffix = self._ParseMrTitleSuffix(node)
+
+        if self._push_options is None:
+            self._push_options = _PushOptions()
+        if self._mr_title_suffix is None:
+            self._mr_title_suffix = _MrTitleSuffix()
 
         def recursively_add_projects(project):
             projects = self._projects.setdefault(project.name, [])
@@ -1777,7 +1949,101 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         d.sync_c = XmlBool(node, "sync-c", False)
         d.sync_s = XmlBool(node, "sync-s", False)
         d.sync_tags = XmlBool(node, "sync-tags", True)
+
+        d.gitlab_url = node.getAttribute("gitlab-url") or None
+        d.enable_central_ci_pipeline = XmlBool(
+            node, "enable-central-ci-pipeline", False
+        )
+        d.central_ci_pipeline_must_success = XmlBool(
+            node, "central-ci-pipeline-must-success", False
+        )
+        d.mono_upload_create_mr_for_central_ci_project = XmlBool(
+            node, "mono-upload-create-mr-for-central-ci-project", False
+        )
+        d.mono_upload_create_mr_for_business_projects = XmlBool(
+            node, "mono-upload-create-mr-for-business-projects", False
+        )
+
+        if d.enable_central_ci_pipeline:
+            if not d.gitlab_url:
+                raise ManifestParseError(
+                    "gitlab-url must be specified when enable-central-ci-pipeline is true"
+                )
+            elif not d.gitlab_url.startswith(("http://", "https://")):
+                raise ManifestParseError(
+                    "gitlab-url must start with http:// or https://"
+                )
+
         return d
+
+    def _ParsePushOptionsChild(self, child_node) -> List[str]:
+        """Parse options from a push-options child node."""
+        options = []
+        for option_node in child_node.childNodes:
+            if (
+                option_node.nodeType == option_node.ELEMENT_NODE
+                and option_node.nodeName == "option"
+            ):
+                option_text = ""
+                for text_node in option_node.childNodes:
+                    if text_node.nodeType == text_node.TEXT_NODE:
+                        option_text += text_node.data
+                if option_text.strip():
+                    options.append(option_text.strip())
+        return options
+
+    def _ParsePushOptions(self, node) -> "_PushOptions":
+        """Reads a <push-options> element from the manifest file."""
+        push_options = _PushOptions()
+        for child in node.childNodes:
+            if child.nodeType != child.ELEMENT_NODE:
+                continue
+            if child.nodeName == "central-ci-project":
+                push_options.central_ci_project = self._ParsePushOptionsChild(
+                    child
+                )
+            elif child.nodeName == "business-projects":
+                push_options.business_projects = self._ParsePushOptionsChild(
+                    child
+                )
+        return push_options
+
+    def _ParseMrTitleSuffix(self, node) -> "_MrTitleSuffix":
+        """Reads a <mr-title-suffix> element from the manifest file."""
+        mr_title_suffix = _MrTitleSuffix()
+        for child in node.childNodes:
+            if child.nodeType != child.ELEMENT_NODE:
+                continue
+            text_content = ""
+            for text_node in child.childNodes:
+                if text_node.nodeType == text_node.TEXT_NODE:
+                    text_content += text_node.data
+            if child.nodeName == "central-ci-project":
+                mr_title_suffix.central_ci_project = text_content.strip()
+            elif child.nodeName == "business-projects":
+                mr_title_suffix.business_projects = text_content.strip()
+        return mr_title_suffix
+
+    def RawManifestFileName(self) -> str:
+        """Retrieve the manifest file name as originally specified in repo init.
+
+        self.manifestFile stores .repo/manifest.xml which contains:
+          <manifest><include name="test.xml" /></manifest>
+        Returns "test.xml".
+        """
+        name = ""
+        try:
+            root = xml.dom.minidom.parse(self.manifestFile)
+            for manifest in root.childNodes:
+                if manifest.nodeName == "manifest":
+                    break
+            for node in manifest.childNodes:
+                if node.nodeName == "include":
+                    name = self._reqatt(node, "name")
+                    break
+        except Exception as error:
+            print(f"Warning: Failed to get manifest file name. {error}")
+        return name
 
     def _ParseNotice(self, node):
         """

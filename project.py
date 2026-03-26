@@ -53,6 +53,7 @@ from git_refs import HEAD
 from git_refs import R_HEADS
 from git_refs import R_M
 from git_refs import R_PUB
+from git_refs import R_REMOTES_ORIGIN
 from git_refs import R_TAGS
 from git_refs import R_WORKTREE_M
 import git_superproject
@@ -697,6 +698,40 @@ class Project:
         )
 
     @property
+    def RootGroup(self) -> str:
+        """Obtain the root group of the project's remote URL.
+
+        Examples:
+            http://gitlab.com/rootgroup/subgroup/repo1.git      -> rootgroup
+            ssh://gitlab.com:29418/rootgroup/subgroup/repo1.git -> rootgroup
+            git@gitlab.com:rootgroup/subgroup/repo1.git         -> rootgroup
+        """
+        return self.GitlabPath.split("/")[0]
+
+    @property
+    def GitlabPath(self) -> str:
+        """Obtain the project path of the project's remote URL.
+
+        Examples:
+            http://gitlab.com/rootgroup/subgroup/repo1.git      -> rootgroup/subgroup/repo1
+            ssh://gitlab.com:29418/rootgroup/subgroup/repo1.git -> rootgroup/subgroup/repo1
+            git@gitlab.com:rootgroup/subgroup/repo1.git         -> rootgroup/subgroup/repo1
+        """
+        repo_url = self.remote.url
+        url_has_protocol = "://" in repo_url
+        if url_has_protocol:
+            url_without_protocol = repo_url.split("://")[1]
+            repo_path = url_without_protocol.split("/", 1)[1]
+        else:
+            repo_path = repo_url.split(":", 1)[1]
+
+        # Remove the .git suffix
+        if repo_path.endswith(".git"):
+            repo_path = repo_path[:-4]
+
+        return repo_path
+
+    @property
     def CurrentBranch(self):
         """Obtain the name of the currently checked out branch.
 
@@ -1111,6 +1146,19 @@ class Project:
             raise GitError("not currently on a branch", project=self.name)
 
         branch = self.GetBranch(branch)
+
+        # Use GitLab push mode when gitlab_url is configured.
+        gitlab_url = getattr(self.manifest.default, "gitlab_url", None)
+        if gitlab_url:
+            return self._UploadForReviewGitlab(
+                branch=branch,
+                dryrun=dryrun,
+                topic=topic,
+                wip=wip,
+                dest_branch=dest_branch,
+                push_options=push_options,
+            )
+
         if not branch.LocalMerge:
             raise GitError(
                 "branch %s does not track a remote" % branch.name,
@@ -1199,6 +1247,142 @@ class Project:
             self.bare_git.UpdateRef(
                 R_PUB + branch.name, R_HEADS + branch.name, message=msg
             )
+
+    def _UploadForReviewGitlab(
+        self,
+        branch,
+        dryrun=False,
+        topic=None,
+        wip=False,
+        dest_branch=None,
+        push_options=None,
+    ):
+        """Uploads the named branch to GitLab using push options for MR creation."""
+        dest_branch = (
+            dest_branch
+            or self.dest_branch
+            or self.revisionExpr
+            or branch.merge
+        )
+        if dest_branch and dest_branch.startswith(R_HEADS):
+            dest_branch = dest_branch[len(R_HEADS):]
+
+        if not branch.remote.projectname:
+            branch.remote.projectname = self.name
+            branch.remote.Save()
+
+        url = branch.remote.url
+        if url is None:
+            raise UploadError("remote url not configured", project=self.name)
+
+        cmd = ["push"]
+        if dryrun:
+            cmd.append("-n")
+
+        if git_require((1, 8, 3)):
+            cmd.append("--no-follow-tags")
+
+        if not dryrun and self.manifest.default.mono_upload_create_mr_for_business_projects:
+            push_options = self._AdjustOptionFormatOfTopic(push_options)
+
+            # Build MR title with optional suffix from manifest
+            mr_title = ""
+            if (
+                self.manifest.mr_title_suffix
+                and self.manifest.mr_title_suffix.business_projects
+            ):
+                try:
+                    base = branch.LocalMerge or self.GetRevisionId()
+                    rb = ReviewableBranch(self, branch, base)
+                    if rb.commits:
+                        first_commit = rb.commits[0]
+                        if " " in first_commit:
+                            mr_title = first_commit.split(" ", 1)[1]
+                        else:
+                            mr_title = first_commit
+                        mr_title += (
+                            f" {self.manifest.mr_title_suffix.business_projects}"
+                        )
+                except Exception:
+                    pass
+
+            push_options += self._GitlabMRCreationPushOptions(
+                target_branch=dest_branch,
+                draft=wip,
+                title=mr_title,
+            )
+
+        # Add push options from manifest business_projects
+        if (
+            self.manifest.push_options
+            and self.manifest.push_options.business_projects
+        ):
+            push_options = push_options or []
+            push_options.extend(self.manifest.push_options.business_projects)
+
+        for push_option in push_options or []:
+            cmd.append("-o")
+            cmd.append(push_option)
+
+        cmd.append(url)
+        cmd.append(R_HEADS + branch.name)
+
+        if GitCommand(self, cmd, bare=True).Wait() != 0:
+            raise UploadError("Upload failed", project=self.name)
+
+        if not dryrun:
+            msg = "posted to %s for %s" % (url, branch.name)
+            self.bare_git.UpdateRef(
+                R_PUB + branch.name, R_HEADS + branch.name, message=msg
+            )
+
+    @classmethod
+    def _AdjustOptionFormatOfTopic(
+        cls, push_options: Optional[List[str]]
+    ) -> List[str]:
+        """Adjust the format of the topic option for GitLab.
+
+        Input:  ["topic=topic_name",   "others_options"]
+                or ["topic::topic_name", "others_options"]
+        Output: ["merge_request.label=topic::topic_name", "others_options"]
+        """
+        push_options = push_options or []
+        new_push_options = []
+        for option in push_options:
+            if option.startswith("topic="):
+                topic_name = option.split("topic=")[1]
+                new_push_options.append(
+                    f"merge_request.label=topic::{topic_name}"
+                )
+            elif option.startswith("topic::"):
+                new_push_options.append(f"merge_request.label={option}")
+            else:
+                new_push_options.append(option)
+        return new_push_options
+
+    @classmethod
+    def _GitlabMRCreationPushOptions(
+        cls,
+        target_branch: str,
+        draft: bool = False,
+        title: str = "",
+    ) -> List[str]:
+        """Build push options for GitLab MR creation."""
+        options = [
+            "merge_request.create",
+            f"merge_request.target={target_branch}",
+            "merge_request.skip_mono_central_pipeline",
+        ]
+
+        if draft:
+            options.append("merge_request.draft")
+
+        if title:
+            escaped_title = title.replace('"', '\\"').replace("\n", " ").strip()
+            if escaped_title:
+                options.append(f"merge_request.title={escaped_title}")
+
+        return options
 
     @staticmethod
     def _encode_patchset_description(original):
@@ -1654,6 +1838,26 @@ class Project:
 
         branch = self.GetBranch(branch)
 
+        # GitLab-specific: if no tracking config but remote branch exists,
+        # auto-configure the tracking reference.
+        if not branch.LocalMerge and getattr(
+            self.manifest.default, "gitlab_url", None
+        ):
+            branch_exists_on_remote = R_REMOTES_ORIGIN + branch.name in all_refs
+            if branch_exists_on_remote:
+                branch.merge = R_HEADS + branch.name
+                branch.Save()
+
+        # GitLab-specific: pull from remote if tracked branch still exists
+        # (may be auto-deleted after MR merge).
+        if (
+            branch.LocalMerge
+            and getattr(self.manifest.default, "gitlab_url", None)
+        ):
+            tracked_branch_exists_on_remote = branch.LocalMerge in all_refs
+            if tracked_branch_exists_on_remote:
+                self.work_git.pull(self.remote.name, "--quiet")
+
         if not branch.LocalMerge:
             # The current branch has no tracking configuration.
             # Jump off it to a detached HEAD.
@@ -1995,11 +2199,12 @@ class Project:
             return True
 
         all_refs = self.bare_ref.all
-        if R_HEADS + name in all_refs:
-            GitCommand(
-                self, ["checkout", "-q", name, "--"], verify_command=True
-            ).Wait()
-            return True
+        branch_exists_locally = R_HEADS + name in all_refs
+        branch_exists_on_remote = R_REMOTES_ORIGIN + name in all_refs
+        if branch_exists_locally or branch_exists_on_remote:
+            return (
+                GitCommand(self, ["checkout", "-q", name, "--"]).Wait() == 0
+            )
 
         branch = self.GetBranch(name)
         branch.remote = self.GetRemote()

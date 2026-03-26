@@ -14,10 +14,12 @@
 
 import copy
 import functools
+import json
 import optparse
 import re
 import sys
-from typing import List
+from typing import List, Optional, Set
+from urllib.parse import urlparse
 
 from command import DEFAULT_LOCAL_JOBS
 from command import InteractiveCommand
@@ -28,18 +30,224 @@ from error import UploadError
 from git_command import GitCommand
 from git_refs import R_HEADS
 import git_superproject
+from gitlab import GitlabAPI
 from hooks import RepoHook
+from manifest_xml import XmlManifest
+from project import ManifestProject
 from project import ReviewableBranch
 from repo_logging import RepoLogger
 from subcmds.sync import LocalSyncState
 
 
 _DEFAULT_UNUSUAL_COMMIT_THRESHOLD = 5
+PipelineUrl = str
 logger = RepoLogger(__file__)
 
 
 class UploadExitError(SilentRepoExitError):
     """Indicates that there is an upload command error requiring a sys exit."""
+
+
+class GitlabCentralCiHelper:
+    """Helper class for GitLab central CI pipeline integration during repo upload."""
+
+    CI_PROJECT_NAME = "monorepo-ci-project"
+
+    def __init__(self, manifest: XmlManifest):
+        self.manifest = manifest
+        self.manifest_project: ManifestProject = manifest.manifestProject
+
+        # NOTE: .git/config does not allow keys to have underscores :(
+        self.access_token_config_key = "manifest.gitlab-personal-access-token"
+
+        gitlab_url = urlparse(self.manifest.default.gitlab_url)
+        self.gitlab_api = GitlabAPI(
+            gitlab_url.netloc, gitlab_url.scheme == "https"
+        )
+
+        projects = self.manifest.projects
+        if not projects:
+            raise ValueError(
+                "No projects defined in the manifest; cannot determine root group."
+            )
+        root_group_of_projects: str = projects[0].RootGroup
+        self.ci_project_path = (
+            f"{root_group_of_projects}/{self.CI_PROJECT_NAME}"
+        )
+
+    def TriggerPipelines(self, branches: List[ReviewableBranch]) -> None:
+        topics = self._FetchTopics(branches)
+        if not topics:
+            print("No central ci pipeline triggered as no topics found.")
+            return
+
+        for topic in topics:
+            self.TriggerPipeline(topic)
+
+    def _FetchTopics(self, branches: List[ReviewableBranch]) -> Set[str]:
+        topics: Set[str] = set()
+        for branch in branches:
+            mr_source_branch = branch.name
+            topics_of_source_branch = self._GetTopicsFromGitLabMRs(
+                branch.project.GitlabPath, mr_source_branch
+            )
+            if topics_of_source_branch:
+                topics.update(topics_of_source_branch)
+        return topics
+
+    def TriggerPipeline(self, topic_name: str) -> None:
+        access_token = self._GetAccessToken()
+        if not access_token:
+            return
+
+        variables = {
+            "MONOREPO_TOPIC_LABEL": topic_name,
+            "MANIFEST_FILE": self.manifest.RawManifestFileName(),
+        }
+
+        if self.manifest.push_options:
+            variables.update(
+                self.manifest.push_options.fetch_central_ci_project_variables()
+            )
+
+        if self.manifest.default.central_ci_pipeline_must_success:
+            variables["CENTRAL_CI_PIPELINE_MUST_SUCCESS"] = "true"
+
+        pipeline_url = self.gitlab_api.TriggerPipeline(
+            token=access_token,
+            project_path=self.ci_project_path,
+            branch="main",
+            variables=variables,
+        )
+        print(f"Triggered pipeline: {pipeline_url} ({topic_name})")
+
+    def CreateMRForCentralCiProject(
+        self, branches: List[ReviewableBranch]
+    ) -> None:
+        topics = self._FetchTopics(branches)
+        if not topics:
+            print("No central ci project MR created as no topics found.")
+            return
+
+        access_token = self._GetAccessToken()
+        if not access_token:
+            return
+
+        central_ci_project_mr_options: dict = {}
+        if self.manifest.push_options:
+            central_ci_project_mr_options = (
+                self.manifest.push_options.fetch_central_ci_project_mr_options()
+            )
+
+        assignee_id = self.GetUserIdByUsername(
+            central_ci_project_mr_options.get("assignee_id")
+        )
+
+        for topic_name in topics:
+            source_branch_name = (
+                f"temp-branch-for-topic-{topic_name.replace('topic::', '')}"
+            )
+            target_branch = "main"
+            self.gitlab_api.CreateBranch(
+                token=access_token,
+                project_path=self.ci_project_path,
+                branch_name=source_branch_name,
+                ref=target_branch,
+            )
+
+            title = central_ci_project_mr_options.get("title") or (
+                f"Auto MR for topic `{topic_name}`"
+            )
+            if (
+                self.manifest.mr_title_suffix
+                and self.manifest.mr_title_suffix.central_ci_project
+            ):
+                title += f" {self.manifest.mr_title_suffix.central_ci_project}"
+
+            mr_web_url: str = self.gitlab_api.CreateMR(
+                token=access_token,
+                project_path=self.ci_project_path,
+                source_branch=source_branch_name,
+                target_branch=target_branch,
+                title=title,
+                description=central_ci_project_mr_options.get("description")
+                or "",
+                labels=[topic_name]
+                + (central_ci_project_mr_options.get("labels") or []),
+                assignee_id=assignee_id,
+                squash=central_ci_project_mr_options.get("squash") or False,
+            )
+            if mr_web_url:
+                print(f"Created MR: {mr_web_url} ({topic_name})")
+                # Extract MR IID from URL path (last numeric path segment).
+                mr_url_path = urlparse(mr_web_url).path.rstrip("/")
+                mr_iid = mr_url_path.split("/")[-1]
+                # Close the MR immediately since it has no commits, which
+                # would block "Merge all".
+                self.gitlab_api.CloseMR(
+                    token=access_token,
+                    project_path=self.ci_project_path,
+                    merge_request_iid=mr_iid,
+                )
+            else:
+                print(f"Failed to create MR for topic `{topic_name}`")
+
+    def _GetAccessToken(self) -> str:
+        access_token: str = self.manifest_project.config.GetString(
+            self.access_token_config_key
+        )
+        if not access_token:
+            prompt = (
+                "Personal Access Token is required for central ci project operations.\n"
+                "Please enter your Token (Press Enter to skip): "
+            )
+            access_token = input(prompt).strip()
+
+        while access_token and not self.gitlab_api.AccessTokenIsValid(
+            access_token
+        ):
+            prompt = (
+                "Your Personal Access Token is unavailable (expired or deleted).\n"
+                "Please enter your new Token (Press Enter to skip): "
+            )
+            access_token = input(prompt).strip()
+
+        self.manifest_project.config.SetString(
+            self.access_token_config_key, access_token or None
+        )
+        return access_token
+
+    def _GetTopicsFromGitLabMRs(
+        self, project_path: str, source_branch: str
+    ) -> List[str]:
+        access_token = self._GetAccessToken()
+        if not access_token:
+            return []
+
+        labels = self.gitlab_api.GetLabelsOfMRs(
+            token=access_token,
+            project_path=project_path,
+            source_branch=source_branch,
+        )
+        return [label for label in labels if label.startswith("topic::")]
+
+    def GetUserIdByUsername(self, username: str) -> Optional[int]:
+        if not username:
+            return None
+
+        if str(username).isdigit():
+            return int(username)
+
+        access_token = self._GetAccessToken()
+        if not access_token:
+            return None
+
+        user_info = self.gitlab_api.GetUser(
+            token=access_token, username=username
+        )
+        if user_info:
+            return user_info.get("id")
+        return None
 
 
 def _VerifyPendingCommits(branches: List[ReviewableBranch]) -> bool:
@@ -702,6 +910,20 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
 
         if have_errors:
             raise UploadExitError(aggregate_errors=aggregate_errors)
+
+        # GitLab-specific: trigger central CI pipeline and/or create MRs
+        # after successful uploads.
+        if not opt.dryrun and getattr(
+            self.manifest.default, "gitlab_url", None
+        ):
+            gitlab_central_ci_helper = GitlabCentralCiHelper(self.manifest)
+
+            if self.manifest.default.mono_upload_create_mr_for_central_ci_project:
+                print("\nCreating central ci project MR...")
+                gitlab_central_ci_helper.CreateMRForCentralCiProject(todo)
+            if self.manifest.default.enable_central_ci_pipeline:
+                print("\nTriggering central ci pipeline...")
+                gitlab_central_ci_helper.TriggerPipelines(todo)
 
     def _GetMergeBranch(self, project, local_branch=None):
         if local_branch is None:
