@@ -505,5 +505,37 @@ class UpdateMRTests(unittest.TestCase):
         self.assertEqual(payload["state_event"], "close")
 
 
+class DeleteBranchTests(unittest.TestCase):
+    """Tests for GitlabAPI.DeleteBranch."""
+
+    def setUp(self):
+        self.api = gitlab.GitlabAPI("gitlab.example.com", True)
+
+    def test_success_returns_true(self):
+        resp = _make_response(204, b"")
+        with mock.patch.object(self.api, "Request", return_value=resp):
+            self.assertTrue(self.api.DeleteBranch("tok", "g/p", "my-branch"))
+
+    def test_failure_returns_false(self):
+        resp = _make_response(404, b"Not Found")
+        with mock.patch.object(self.api, "Request", return_value=resp):
+            self.assertFalse(self.api.DeleteBranch("tok", "g/p", "missing"))
+
+    def test_branch_name_is_url_encoded_in_path(self):
+        resp = _make_response(204, b"")
+        with mock.patch.object(self.api, "Request", return_value=resp) as mock_req:
+            self.api.DeleteBranch("tok", "g/p", "feature/my-branch")
+        args, _ = mock_req.call_args
+        # The path argument must have the slash percent-encoded.
+        self.assertIn("feature%2Fmy-branch", args[1])
+
+    def test_uses_delete_http_method(self):
+        resp = _make_response(204, b"")
+        with mock.patch.object(self.api, "Request", return_value=resp) as mock_req:
+            self.api.DeleteBranch("tok", "g/p", "main")
+        args, _ = mock_req.call_args
+        self.assertEqual(args[0], "DELETE")
+
+
 if __name__ == "__main__":
     unittest.main()

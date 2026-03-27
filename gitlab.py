@@ -323,6 +323,32 @@ class GitlabAPI:
 
         return False
 
+    def DeleteBranch(
+        self,
+        token: str,
+        project_path: str,
+        branch_name: str,
+    ) -> bool:
+        """Delete a branch from a project.
+
+        Returns:
+            True if the branch was deleted successfully, False otherwise.
+        """
+        encoded_branch = urllib.parse.quote(branch_name, safe="")
+        path = (
+            f"/api/v4/projects/{self.encode_project_path(project_path)}"
+            f"/repository/branches/{encoded_branch}"
+        )
+
+        response = self.Request(
+            "DELETE",
+            path,
+            token=token,
+            retry=3,
+        )
+
+        return self._HttpStatusSuccess(response.status)
+
     @classmethod
     def encode_project_path(cls, project_path: str) -> str:
         return urllib.parse.quote_plus(project_path.strip("/"))
